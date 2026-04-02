@@ -6,10 +6,17 @@ import java.io.InputStream;
 import java.io.IOException;
 
 import java.io.InterruptedIOException;
+import java.net.HttpURLConnection;
 import java.net.SocketTimeoutException;
+import java.net.URI;
+import java.net.URL;
 import java.net.UnknownHostException;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 import javax.net.ssl.SSLException;
 
@@ -72,6 +79,8 @@ abstract class CordovaHttpBase implements Runnable {
     this.callbackContext = callbackContext;
   }
 
+  private static final int MAX_REDIRECTS = 10;
+
   @Override
   public void run() {
     CordovaHttpResponse response = new CordovaHttpResponse();
@@ -81,6 +90,85 @@ abstract class CordovaHttpBase implements Runnable {
       request = this.createRequest();
       this.prepareRequest(request);
       this.sendBody(request);
+
+      // Manually follow redirects to persist cookies from intermediate responses
+      if (this.followRedirects) {
+        Map<String, String> collectedCookies = new HashMap<String, String>();
+        int redirectCount = 0;
+
+        while (redirectCount < MAX_REDIRECTS) {
+          int code = request.code();
+
+          if (code != HttpURLConnection.HTTP_MOVED_PERM
+              && code != HttpURLConnection.HTTP_MOVED_TEMP
+              && code != HttpURLConnection.HTTP_SEE_OTHER
+              && code != 307 && code != 308) {
+            break;
+          }
+
+          // Collect Set-Cookie headers from the redirect response
+          Map<String, List<String>> redirectHeaders = request.headers();
+          List<String> setCookieHeaders = new ArrayList<String>();
+
+          for (Map.Entry<String, List<String>> entry : redirectHeaders.entrySet()) {
+            if (entry.getKey() != null && entry.getKey().equalsIgnoreCase("Set-Cookie")) {
+              setCookieHeaders = entry.getValue();
+            }
+          }
+
+          for (String cookie : setCookieHeaders) {
+            // Extract cookie name=value (before any attributes like ;path=/)
+            String nameValue = cookie.split(";")[0].trim();
+            String name = nameValue.split("=")[0].trim();
+            collectedCookies.put(name, nameValue);
+          }
+
+          // Resolve the redirect URL (may be relative)
+          String location = request.header("Location");
+          if (location == null || location.isEmpty()) {
+            break;
+          }
+
+          URL currentUrl = request.url();
+          URL redirectUrl = new URL(currentUrl, location);
+          request.disconnect();
+
+          // Use GET for 301/302/303 redirects per HTTP spec (POST -> GET)
+          String redirectMethod = this.method;
+          if (code == HttpURLConnection.HTTP_MOVED_PERM
+              || code == HttpURLConnection.HTTP_MOVED_TEMP
+              || code == HttpURLConnection.HTTP_SEE_OTHER) {
+            redirectMethod = "GET";
+          }
+
+          request = new HttpRequest(redirectUrl.toString(), redirectMethod);
+          request.followRedirects(false);
+          request.connectTimeout(this.connectTimeout);
+          request.readTimeout(this.readTimeout);
+          request.uncompress(true);
+
+          if (this.tlsConfiguration.getHostnameVerifier() != null) {
+            request.setHostnameVerifier(this.tlsConfiguration.getHostnameVerifier());
+          }
+          request.setSSLSocketFactory(this.tlsConfiguration.getTLSSocketFactory());
+          request.headers(JsonUtils.getStringMap(this.headers));
+
+          // Inject collected cookies into the redirect request
+          if (!collectedCookies.isEmpty()) {
+            StringBuilder cookieHeader = new StringBuilder();
+            for (String nameValue : collectedCookies.values()) {
+              if (cookieHeader.length() > 0) {
+                cookieHeader.append("; ");
+              }
+              cookieHeader.append(nameValue);
+            }
+            request.header("Cookie", cookieHeader.toString());
+          }
+
+          redirectCount++;
+        }
+      }
+
       this.processResponse(request, response);
       request.disconnect();
     } catch (HttpRequestException e) {
@@ -130,7 +218,9 @@ abstract class CordovaHttpBase implements Runnable {
   }
 
   protected void prepareRequest(HttpRequest request) throws JSONException, IOException {
-    request.followRedirects(this.followRedirects);
+    // Always disable automatic redirects so we can manually handle them
+    // and persist cookies from intermediate redirect responses
+    request.followRedirects(false);
     request.connectTimeout(this.connectTimeout);
     request.readTimeout(this.readTimeout);
     request.uncompress(true);

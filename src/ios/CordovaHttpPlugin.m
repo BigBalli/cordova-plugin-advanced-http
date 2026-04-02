@@ -90,6 +90,31 @@
         NSURLSessionTask * _Nonnull task, NSURLResponse * _Nonnull response, NSURLRequest * _Nonnull request) {
 
         if (followRedirect) {
+            // Extract Set-Cookie headers from the redirect response and persist them.
+            // Without this, cookies set on 301/302 responses are silently dropped because
+            // HTTPShouldHandleCookies is NO (cookie management is handled in JS).
+            if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+                NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+                NSArray *cookies = [NSHTTPCookie cookiesWithResponseHeaderFields:[httpResponse allHeaderFields]
+                                                                         forURL:response.URL];
+
+                if ([cookies count] > 0) {
+                    [[NSHTTPCookieStorage sharedHTTPCookieStorage] setCookies:cookies
+                                                                      forURL:response.URL
+                                                             mainDocumentURL:nil];
+
+                    // Inject cookies into the redirect request since automatic cookie handling is disabled
+                    NSArray *allCookies = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookiesForURL:request.URL];
+                    if ([allCookies count] > 0) {
+                        NSDictionary *cookieHeaders = [NSHTTPCookie requestHeaderFieldsWithCookies:allCookies];
+                        NSMutableURLRequest *mutableRequest = [request mutableCopy];
+                        [cookieHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
+                            [mutableRequest setValue:value forHTTPHeaderField:key];
+                        }];
+                        return (NSURLRequest *)mutableRequest;
+                    }
+                }
+            }
             return request;
         } else {
             return nil;
